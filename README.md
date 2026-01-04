@@ -15,8 +15,19 @@ cargo build
 cargo run
 ```
 
+The demo expects a `.schema.json` file in the working directory with
+`x-primaryKey` set to a JSON Pointer string. The repository includes a minimal
+sample schema.
+
 Expected output:
 
 ```
 constant
+```
+
+You can also pass `--validate` (default off) to exercise the validation flag
+plumbing:
+
+```
+cargo run -- --validate
 ```
