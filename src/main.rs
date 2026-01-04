@@ -801,8 +801,8 @@ fn setup_db(config: &AppConfig) -> Result<Connection> {
 #[cfg(test)]
 mod tests {
     use super::{
-        load_schema_config, setup_db, AppConfig, Dataset, DatasetMetadata, LoaderError,
-        RecordMetadata, SchemaConfig,
+        load_dataset, load_schema_config, setup_db, AppConfig, Dataset, DatasetMetadata,
+        LoaderError, RecordMetadata, SchemaConfig,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -834,6 +834,14 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    fn fixture_dir(name: &str) -> PathBuf {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("tests");
+        path.push("fixtures");
+        path.push(name);
+        path
     }
 
     #[test]
@@ -916,5 +924,95 @@ mod tests {
 
         let err = load_schema_config(&dir.path).expect_err("invalid pointer");
         assert!(matches!(err, LoaderError::InvalidPrimaryKeyPointer { .. }));
+    }
+
+    #[test]
+    fn load_dataset_extracts_primary_and_fallback_keys() {
+        let root = fixture_dir("keys");
+        let dataset = load_dataset(&root, false).expect("load dataset");
+
+        let mut keys: Vec<String> = dataset
+            .records
+            .iter()
+            .map(|record| record.key.clone())
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "alpha".to_string(),
+                "fallback.json".to_string(),
+                "line-one".to_string(),
+                "lines.jsonl#2".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn load_dataset_errors_on_duplicate_key() {
+        let root = fixture_dir("duplicate");
+        let err = load_dataset(&root, false).expect_err("duplicate key");
+        match err {
+            LoaderError::DuplicateKey { key, .. } => assert_eq!(key, "dup"),
+            other => panic!("expected duplicate key error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_dataset_drops_trailing_partial_jsonl_line() {
+        let root = fixture_dir("jsonl-trailing");
+        let dataset = load_dataset(&root, false).expect("load dataset");
+        assert_eq!(dataset.records.len(), 1);
+        assert_eq!(dataset.records[0].key, "row-one");
+    }
+
+    #[test]
+    fn load_dataset_validation_flag_controls_schema_errors() {
+        let root = fixture_dir("validation");
+        let dataset = load_dataset(&root, false).expect("load dataset without validation");
+        assert_eq!(dataset.records.len(), 1);
+        let err = load_dataset(&root, true).expect_err("validation error");
+        assert!(matches!(err, LoaderError::SchemaValidation { .. }));
+    }
+
+    #[test]
+    fn dataset_vtab_supports_key_lookup_and_full_scan() {
+        let root = fixture_dir("keys");
+        let dataset = load_dataset(&root, false).expect("load dataset");
+        let mut expected_keys: Vec<String> = dataset
+            .records
+            .iter()
+            .map(|record| record.key.clone())
+            .collect();
+        expected_keys.sort();
+
+        let config = AppConfig {
+            validate: false,
+            dataset: Arc::new(dataset),
+        };
+        let db = setup_db(&config).expect("db setup");
+
+        let (key, json): (String, String) = db
+            .query_row(
+                "SELECT key, json FROM dataset WHERE key = ?1",
+                ["alpha"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("filtered row");
+        assert_eq!(key, "alpha");
+        assert_eq!(json, "{\"id\":\"alpha\",\"name\":\"Alpha\"}");
+
+        let mut stmt = db
+            .prepare("SELECT key FROM dataset")
+            .expect("prepare scan");
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("scan keys");
+        let mut seen = Vec::new();
+        for row in rows {
+            seen.push(row.expect("scan row"));
+        }
+        seen.sort();
+        assert_eq!(seen, expected_keys);
     }
 }
