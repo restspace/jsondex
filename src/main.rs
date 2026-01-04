@@ -1,10 +1,14 @@
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io;
 use std::os::raw::c_int;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::thread;
+use std::time::{Duration, SystemTime};
 
+use jsonschema::JSONSchema;
 use rusqlite::ffi;
 use rusqlite::types::Null;
 use rusqlite::vtab::{
@@ -18,6 +22,7 @@ use serde_json::Value;
 struct SchemaConfig {
     path: PathBuf,
     primary_key_ptr: String,
+    schema_json: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -27,8 +32,16 @@ struct DatasetMetadata {
 }
 
 #[derive(Debug, Clone)]
+struct Dataset {
+    metadata: DatasetMetadata,
+    records: Vec<RecordMetadata>,
+    #[allow(dead_code)]
+    index: HashMap<String, usize>,
+}
+
+#[derive(Debug, Clone)]
 struct AppConfig {
-    dataset: DatasetMetadata,
+    dataset: Dataset,
     validate: bool,
 }
 
@@ -44,11 +57,43 @@ struct RecordMetadata {
 }
 
 #[derive(Debug)]
+struct FileSnapshot {
+    bytes: Vec<u8>,
+    mtime: SystemTime,
+    size: u64,
+}
+
+const FILE_READ_RETRIES: usize = 3;
+const FILE_READ_DELAY_MS: u64 = 10;
+
+#[derive(Debug)]
 enum LoaderError {
     MissingSchema { path: PathBuf },
     InvalidPrimaryKeyPointer { pointer: String },
     SchemaRead { path: PathBuf, source: io::Error },
     SchemaParse { path: PathBuf, source: serde_json::Error },
+    SchemaCompile { path: PathBuf, message: String },
+    DatasetScan { path: PathBuf, source: io::Error },
+    FileMetadata { path: PathBuf, source: io::Error },
+    FileRead { path: PathBuf, source: io::Error },
+    FileChanged { path: PathBuf },
+    JsonParse {
+        path: PathBuf,
+        line_no: u64,
+        source: serde_json::Error,
+    },
+    SchemaValidation {
+        path: PathBuf,
+        line_no: u64,
+        message: String,
+    },
+    DuplicateKey {
+        key: String,
+        path: PathBuf,
+        line_no: u64,
+        existing_path: PathBuf,
+        existing_line: u64,
+    },
 }
 
 impl std::fmt::Display for LoaderError {
@@ -70,6 +115,73 @@ impl std::fmt::Display for LoaderError {
                     path.display()
                 )
             }
+            LoaderError::SchemaCompile { path, message } => {
+                write!(
+                    f,
+                    "failed to compile schema at {}: {message}",
+                    path.display()
+                )
+            }
+            LoaderError::DatasetScan { path, source } => {
+                write!(
+                    f,
+                    "failed to scan dataset directory {}: {source}",
+                    path.display()
+                )
+            }
+            LoaderError::FileMetadata { path, source } => {
+                write!(
+                    f,
+                    "failed to read file metadata at {}: {source}",
+                    path.display()
+                )
+            }
+            LoaderError::FileRead { path, source } => {
+                write!(f, "failed to read data file at {}: {source}", path.display())
+            }
+            LoaderError::FileChanged { path } => {
+                write!(f, "data file changed during read: {}", path.display())
+            }
+            LoaderError::JsonParse {
+                path,
+                line_no,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to parse JSON at {}:{}: {source}",
+                    path.display(),
+                    line_no
+                )
+            }
+            LoaderError::SchemaValidation {
+                path,
+                line_no,
+                message,
+            } => {
+                write!(
+                    f,
+                    "schema validation failed at {}:{}: {message}",
+                    path.display(),
+                    line_no
+                )
+            }
+            LoaderError::DuplicateKey {
+                key,
+                path,
+                line_no,
+                existing_path,
+                existing_line,
+            } => {
+                write!(
+                    f,
+                    "duplicate key \"{key}\" at {}:{} (already defined at {}:{})",
+                    path.display(),
+                    line_no,
+                    existing_path.display(),
+                    existing_line
+                )
+            }
         }
     }
 }
@@ -79,6 +191,10 @@ impl std::error::Error for LoaderError {
         match self {
             LoaderError::SchemaRead { source, .. } => Some(source),
             LoaderError::SchemaParse { source, .. } => Some(source),
+            LoaderError::DatasetScan { source, .. } => Some(source),
+            LoaderError::FileMetadata { source, .. } => Some(source),
+            LoaderError::FileRead { source, .. } => Some(source),
+            LoaderError::JsonParse { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -170,7 +286,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn load_app_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
     let validate = parse_validate_flag()?;
     let dataset_root = env::current_dir()?;
-    let dataset = load_dataset_metadata(&dataset_root)?;
+    let dataset = load_dataset(&dataset_root, validate)?;
     Ok(AppConfig { dataset, validate })
 }
 
@@ -183,6 +299,55 @@ fn parse_validate_flag() -> Result<bool, Box<dyn std::error::Error>> {
         }
     }
     Ok(validate)
+}
+
+fn load_dataset(dataset_root: &Path, validate: bool) -> Result<Dataset, LoaderError> {
+    let metadata = load_dataset_metadata(dataset_root)?;
+    let validator = if validate {
+        Some(build_validator(&metadata.schema)?)
+    } else {
+        None
+    };
+    let files = collect_dataset_files(dataset_root)?;
+    let mut records = Vec::new();
+    let mut index = HashMap::new();
+
+    for path in files {
+        let snapshot = read_file_stable(&path)?;
+        let relative_path = relative_path_string(dataset_root, &path);
+        let extension = path.extension().and_then(|ext| ext.to_str());
+        match extension {
+            Some(ext) if ext.eq_ignore_ascii_case("jsonl") => {
+                load_jsonl_records(
+                    &metadata.schema,
+                    &path,
+                    &relative_path,
+                    snapshot,
+                    validator.as_ref(),
+                    &mut records,
+                    &mut index,
+                )?;
+            }
+            Some(ext) if ext.eq_ignore_ascii_case("json") => {
+                load_json_record(
+                    &metadata.schema,
+                    &path,
+                    &relative_path,
+                    snapshot,
+                    validator.as_ref(),
+                    &mut records,
+                    &mut index,
+                )?;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(Dataset {
+        metadata,
+        records,
+        index,
+    })
 }
 
 fn load_dataset_metadata(dataset_root: &Path) -> Result<DatasetMetadata, LoaderError> {
@@ -221,6 +386,7 @@ fn load_schema_config(dataset_root: &Path) -> Result<SchemaConfig, LoaderError> 
     Ok(SchemaConfig {
         path: schema_path,
         primary_key_ptr: primary_key_ptr.to_string(),
+        schema_json,
     })
 }
 
@@ -263,11 +429,263 @@ fn is_valid_json_pointer(pointer: &str) -> bool {
     true
 }
 
+fn build_validator(schema: &SchemaConfig) -> Result<JSONSchema, LoaderError> {
+    JSONSchema::compile(&schema.schema_json).map_err(|err| LoaderError::SchemaCompile {
+        path: schema.path.clone(),
+        message: err.to_string(),
+    })
+}
+
+fn collect_dataset_files(dataset_root: &Path) -> Result<Vec<PathBuf>, LoaderError> {
+    let mut files = Vec::new();
+    collect_dataset_files_inner(dataset_root, &mut files)?;
+    files.sort_by(|left, right| {
+        relative_path_string(dataset_root, left).cmp(&relative_path_string(dataset_root, right))
+    });
+    Ok(files)
+}
+
+fn collect_dataset_files_inner(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), LoaderError> {
+    let entries = fs::read_dir(dir).map_err(|source| LoaderError::DatasetScan {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+    let mut entries: Vec<_> = entries
+        .collect::<Result<_, _>>()
+        .map_err(|source| LoaderError::DatasetScan {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|source| LoaderError::DatasetScan {
+                path: path.clone(),
+                source,
+            })?;
+        if file_type.is_dir() {
+            collect_dataset_files_inner(&path, files)?;
+        } else if file_type.is_file() && is_dataset_file(&path) {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn is_dataset_file(path: &Path) -> bool {
+    let file_name = path.file_name().and_then(|name| name.to_str());
+    if file_name == Some(".schema.json") {
+        return false;
+    }
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) if ext.eq_ignore_ascii_case("json") => true,
+        Some(ext) if ext.eq_ignore_ascii_case("jsonl") => true,
+        _ => false,
+    }
+}
+
+fn relative_path_string(root: &Path, path: &Path) -> String {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    let mut normalized = String::new();
+    for (index, component) in relative.components().enumerate() {
+        if index > 0 {
+            normalized.push('/');
+        }
+        normalized.push_str(&component.as_os_str().to_string_lossy());
+    }
+    normalized
+}
+
+fn read_file_stable(path: &Path) -> Result<FileSnapshot, LoaderError> {
+    for attempt in 0..FILE_READ_RETRIES {
+        let (before_mtime, before_size) = read_file_metadata(path)?;
+        let bytes = fs::read(path).map_err(|source| LoaderError::FileRead {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let (after_mtime, after_size) = read_file_metadata(path)?;
+        let bytes_len = bytes.len() as u64;
+
+        if before_size == after_size && before_mtime == after_mtime && bytes_len == after_size {
+            return Ok(FileSnapshot {
+                bytes,
+                mtime: after_mtime,
+                size: after_size,
+            });
+        }
+
+        if attempt + 1 < FILE_READ_RETRIES {
+            thread::sleep(Duration::from_millis(FILE_READ_DELAY_MS));
+        }
+    }
+
+    Err(LoaderError::FileChanged {
+        path: path.to_path_buf(),
+    })
+}
+
+fn read_file_metadata(path: &Path) -> Result<(SystemTime, u64), LoaderError> {
+    let metadata = fs::metadata(path).map_err(|source| LoaderError::FileMetadata {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let modified = metadata.modified().map_err(|source| LoaderError::FileMetadata {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok((modified, metadata.len()))
+}
+
+fn load_json_record(
+    schema: &SchemaConfig,
+    path: &Path,
+    relative_path: &str,
+    snapshot: FileSnapshot,
+    validator: Option<&JSONSchema>,
+    records: &mut Vec<RecordMetadata>,
+    index: &mut HashMap<String, usize>,
+) -> Result<(), LoaderError> {
+    let line_no = 1;
+    let value: Value =
+        serde_json::from_slice(&snapshot.bytes).map_err(|source| LoaderError::JsonParse {
+            path: path.to_path_buf(),
+            line_no,
+            source,
+        })?;
+    validate_record(validator, &value, path, line_no)?;
+    let key = record_key(&value, &schema.primary_key_ptr, relative_path);
+    let record = RecordMetadata {
+        key,
+        json_bytes: snapshot.bytes,
+        source_path: path.to_path_buf(),
+        line_no,
+        mtime: snapshot.mtime,
+        size: snapshot.size,
+    };
+    insert_record(record, index, records)?;
+    Ok(())
+}
+
+fn load_jsonl_records(
+    schema: &SchemaConfig,
+    path: &Path,
+    relative_path: &str,
+    snapshot: FileSnapshot,
+    validator: Option<&JSONSchema>,
+    records: &mut Vec<RecordMetadata>,
+    index: &mut HashMap<String, usize>,
+) -> Result<(), LoaderError> {
+    let mut lines: Vec<&[u8]> = snapshot.bytes.split(|byte| *byte == b'\n').collect();
+    let has_trailing_newline = snapshot.bytes.last().map(|byte| *byte == b'\n').unwrap_or(false);
+    if has_trailing_newline {
+        if lines.last().is_some_and(|line| line.is_empty()) {
+            lines.pop();
+        }
+    } else if !lines.is_empty() {
+        lines.pop();
+    }
+
+    for (index_line, line) in lines.iter().enumerate() {
+        let line_no = index_line as u64 + 1;
+        let trimmed = trim_cr(line);
+        let value: Value =
+            serde_json::from_slice(trimmed).map_err(|source| LoaderError::JsonParse {
+                path: path.to_path_buf(),
+                line_no,
+                source,
+            })?;
+        validate_record(validator, &value, path, line_no)?;
+        let fallback_key = format!("{relative_path}#{line_no}");
+        let key = record_key(&value, &schema.primary_key_ptr, &fallback_key);
+        let record = RecordMetadata {
+            key,
+            json_bytes: trimmed.to_vec(),
+            source_path: path.to_path_buf(),
+            line_no,
+            mtime: snapshot.mtime,
+            size: snapshot.size,
+        };
+        insert_record(record, index, records)?;
+    }
+    Ok(())
+}
+
+fn trim_cr(line: &[u8]) -> &[u8] {
+    if line.ends_with(b"\r") {
+        &line[..line.len() - 1]
+    } else {
+        line
+    }
+}
+
+fn validate_record(
+    validator: Option<&JSONSchema>,
+    value: &Value,
+    path: &Path,
+    line_no: u64,
+) -> Result<(), LoaderError> {
+    if let Some(validator) = validator {
+        if let Err(errors) = validator.validate(value) {
+            if let Some(error) = errors.into_iter().next() {
+                return Err(LoaderError::SchemaValidation {
+                    path: path.to_path_buf(),
+                    line_no,
+                    message: error.to_string(),
+                });
+            }
+            return Err(LoaderError::SchemaValidation {
+                path: path.to_path_buf(),
+                line_no,
+                message: "schema validation failed".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn record_key(value: &Value, primary_key_ptr: &str, fallback: &str) -> String {
+    match value.pointer(primary_key_ptr) {
+        Some(Value::String(value)) => value.clone(),
+        Some(Value::Null) | None => fallback.to_string(),
+        Some(value) => value.to_string(),
+    }
+}
+
+fn insert_record(
+    record: RecordMetadata,
+    index: &mut HashMap<String, usize>,
+    records: &mut Vec<RecordMetadata>,
+) -> Result<(), LoaderError> {
+    let key = record.key.clone();
+    match index.entry(key.clone()) {
+        Entry::Vacant(entry) => {
+            let next_index = records.len();
+            entry.insert(next_index);
+            records.push(record);
+            Ok(())
+        }
+        Entry::Occupied(entry) => {
+            let existing = &records[*entry.get()];
+            Err(LoaderError::DuplicateKey {
+                key,
+                path: record.source_path.clone(),
+                line_no: record.line_no,
+                existing_path: existing.source_path.clone(),
+                existing_line: existing.line_no,
+            })
+        }
+    }
+}
+
 fn setup_db(config: &AppConfig) -> Result<Connection> {
     let _ = (
-        &config.dataset.root,
-        &config.dataset.schema.path,
-        &config.dataset.schema.primary_key_ptr,
+        &config.dataset.metadata.root,
+        &config.dataset.metadata.schema.path,
+        &config.dataset.metadata.schema.primary_key_ptr,
+        config.dataset.records.len(),
         config.validate,
     );
     let db = Connection::open_in_memory()?;
@@ -279,9 +697,9 @@ fn setup_db(config: &AppConfig) -> Result<Connection> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        load_schema_config, setup_db, AppConfig, DatasetMetadata, LoaderError, SchemaConfig,
-    };
+    use super::{load_schema_config, setup_db, AppConfig, Dataset, DatasetMetadata, LoaderError};
+    use serde_json::json;
+    use std::collections::HashMap;
     use std::env;
     use std::fs;
     use std::path::PathBuf;
@@ -313,15 +731,21 @@ mod tests {
 
     #[test]
     fn constrow_returns_single_constant_row() {
-        let config = AppConfig {
-            validate: false,
-            dataset: DatasetMetadata {
+        let dataset = Dataset {
+            metadata: DatasetMetadata {
                 root: PathBuf::from("testdata"),
-                schema: SchemaConfig {
+                schema: super::SchemaConfig {
                     path: PathBuf::from("testdata/.schema.json"),
                     primary_key_ptr: "/id".to_string(),
+                    schema_json: json!({"x-primaryKey": "/id"}),
                 },
             },
+            records: Vec::new(),
+            index: HashMap::new(),
+        };
+        let config = AppConfig {
+            validate: false,
+            dataset,
         };
         let db = setup_db(&config).expect("db setup");
         let mut stmt = db
@@ -346,6 +770,7 @@ mod tests {
         let schema = load_schema_config(&dir.path).expect("load schema");
         assert_eq!(schema.primary_key_ptr, "/id");
         assert_eq!(schema.path, schema_path);
+        assert_eq!(schema.schema_json, json!({"x-primaryKey":"/id"}));
     }
 
     #[test]
