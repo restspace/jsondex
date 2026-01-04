@@ -5,17 +5,18 @@ use std::fs;
 use std::io;
 use std::os::raw::c_int;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use jsonschema::JSONSchema;
 use rusqlite::ffi;
 use rusqlite::types::Null;
 use rusqlite::vtab::{
-    read_only_module, Context, CreateVTab, IndexInfo, VTab, VTabConnection, VTabCursor, VTabKind,
-    Values,
+    read_only_module, Context, CreateVTab, IndexConstraintOp, IndexFlags, IndexInfo, VTab,
+    VTabConfig, VTabConnection, VTabCursor, VTabKind, Values,
 };
-use rusqlite::{Connection, Result};
+use rusqlite::{Connection, Error, Result};
 use serde_json::Value;
 
 #[derive(Debug, Clone)]
@@ -35,13 +36,12 @@ struct DatasetMetadata {
 struct Dataset {
     metadata: DatasetMetadata,
     records: Vec<RecordMetadata>,
-    #[allow(dead_code)]
     index: HashMap<String, usize>,
 }
 
 #[derive(Debug, Clone)]
 struct AppConfig {
-    dataset: Dataset,
+    dataset: Arc<Dataset>,
     validate: bool,
 }
 
@@ -201,71 +201,150 @@ impl std::error::Error for LoaderError {
 }
 
 #[repr(C)]
-struct ConstRowVTab {
+struct DatasetVTab {
     base: ffi::sqlite3_vtab,
+    dataset: Arc<Dataset>,
 }
 
 #[repr(C)]
-struct ConstRowCursor {
+struct DatasetCursor {
     base: ffi::sqlite3_vtab_cursor,
-    done: bool,
+    dataset: Arc<Dataset>,
+    row_index: usize,
+    use_key: bool,
 }
 
-unsafe impl<'vtab> VTab<'vtab> for ConstRowVTab {
-    type Aux = ();
-    type Cursor = ConstRowCursor;
+const IDX_SCAN: c_int = 0;
+const IDX_KEY_EQ: c_int = 1;
+
+const COL_KEY: c_int = 0;
+const COL_JSON: c_int = 1;
+const COL_SOURCE_PATH: c_int = 2;
+const COL_LINE_NO: c_int = 3;
+const COL_MTIME: c_int = 4;
+const COL_SIZE: c_int = 5;
+
+unsafe impl<'vtab> VTab<'vtab> for DatasetVTab {
+    type Aux = Arc<Dataset>;
+    type Cursor = DatasetCursor;
 
     fn connect(
-        _db: &mut VTabConnection,
-        _aux: Option<&Self::Aux>,
+        db: &mut VTabConnection,
+        aux: Option<&Self::Aux>,
         _args: &[&[u8]],
     ) -> Result<(String, Self)> {
-        let vtab = ConstRowVTab {
+        db.config(VTabConfig::ConstraintSupport)?;
+        let dataset = aux
+            .cloned()
+            .ok_or_else(|| Error::ModuleError("dataset snapshot missing".to_string()))?;
+        let vtab = DatasetVTab {
             base: ffi::sqlite3_vtab::default(),
+            dataset,
         };
-        Ok(("CREATE TABLE x(value TEXT)".to_owned(), vtab))
+        Ok((
+            "CREATE TABLE x(key TEXT, json TEXT, source_path TEXT, line_no INTEGER, mtime INTEGER, size INTEGER)"
+                .to_owned(),
+            vtab,
+        ))
     }
 
-    fn best_index(&self, _info: &mut IndexInfo) -> Result<()> {
+    fn best_index(&self, info: &mut IndexInfo) -> Result<()> {
+        for (constraint, mut usage) in info.constraints_and_usages() {
+            if constraint.is_usable()
+                && constraint.column() == COL_KEY
+                && constraint.operator() == IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_EQ
+            {
+                usage.set_argv_index(1);
+                usage.set_omit(true);
+                info.set_idx_num(IDX_KEY_EQ);
+                info.set_estimated_cost(1.0);
+                info.set_estimated_rows(1);
+                info.set_idx_flags(IndexFlags::SQLITE_INDEX_SCAN_UNIQUE);
+                return Ok(());
+            }
+        }
+
+        let rows = self.dataset.records.len() as i64;
+        info.set_idx_num(IDX_SCAN);
+        info.set_estimated_cost(rows as f64);
+        info.set_estimated_rows(rows);
         Ok(())
     }
 
     fn open(&'vtab mut self) -> Result<Self::Cursor> {
-        Ok(ConstRowCursor {
+        Ok(DatasetCursor {
             base: ffi::sqlite3_vtab_cursor::default(),
-            done: false,
+            dataset: Arc::clone(&self.dataset),
+            row_index: 0,
+            use_key: false,
         })
     }
 }
 
-impl CreateVTab<'_> for ConstRowVTab {
+impl CreateVTab<'_> for DatasetVTab {
     const KIND: VTabKind = VTabKind::Default;
 }
 
-unsafe impl VTabCursor for ConstRowCursor {
-    fn filter(&mut self, _idx_num: c_int, _idx_str: Option<&str>, _args: &Values<'_>) -> Result<()> {
-        self.done = false;
+unsafe impl VTabCursor for DatasetCursor {
+    fn filter(&mut self, idx_num: c_int, _idx_str: Option<&str>, args: &Values<'_>) -> Result<()> {
+        self.use_key = idx_num == IDX_KEY_EQ;
+        if self.use_key {
+            if args.is_empty() {
+                self.row_index = self.dataset.records.len();
+                return Ok(());
+            }
+            let key: String = args.get(0)?;
+            self.row_index = self
+                .dataset
+                .index
+                .get(&key)
+                .copied()
+                .unwrap_or(self.dataset.records.len());
+        } else {
+            self.row_index = 0;
+        }
         Ok(())
     }
 
     fn next(&mut self) -> Result<()> {
-        self.done = true;
+        if self.use_key {
+            self.row_index = self.dataset.records.len();
+        } else {
+            self.row_index = self.row_index.saturating_add(1);
+        }
         Ok(())
     }
 
     fn eof(&self) -> bool {
-        self.done
+        self.row_index >= self.dataset.records.len()
     }
 
     fn column(&self, ctx: &mut Context, i: c_int) -> Result<()> {
+        let record = self.dataset.records.get(self.row_index).ok_or_else(|| {
+            Error::ModuleError("cursor out of bounds for dataset".to_string())
+        })?;
         match i {
-            0 => ctx.set_result(&"constant"),
+            COL_KEY => ctx.set_result(&record.key),
+            COL_JSON => {
+                let json = String::from_utf8_lossy(&record.json_bytes).into_owned();
+                ctx.set_result(&json)
+            }
+            COL_SOURCE_PATH => {
+                let path = record.source_path.to_string_lossy().into_owned();
+                ctx.set_result(&path)
+            }
+            COL_LINE_NO => ctx.set_result(&clamp_u64_to_i64(record.line_no)),
+            COL_MTIME => ctx.set_result(&system_time_to_unix_secs(record.mtime)),
+            COL_SIZE => ctx.set_result(&clamp_u64_to_i64(record.size)),
             _ => ctx.set_result(&Null),
         }
     }
 
     fn rowid(&self) -> Result<i64> {
-        Ok(1)
+        let record = self.dataset.records.get(self.row_index).ok_or_else(|| {
+            Error::ModuleError("cursor out of bounds for dataset".to_string())
+        })?;
+        Ok(stable_rowid(&record.key))
     }
 }
 
@@ -273,11 +352,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = load_app_config()?;
     let db = setup_db(&config)?;
 
-    let mut stmt = db.prepare("SELECT value FROM const_row;")?;
+    let mut stmt = db.prepare("SELECT key, json FROM dataset;")?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
-        let value: String = row.get(0)?;
-        println!("{value}");
+        let key: String = row.get(0)?;
+        let json: String = row.get(1)?;
+        println!("{key}\t{json}");
     }
 
     Ok(())
@@ -287,7 +367,10 @@ fn load_app_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
     let validate = parse_validate_flag()?;
     let dataset_root = env::current_dir()?;
     let dataset = load_dataset(&dataset_root, validate)?;
-    Ok(AppConfig { dataset, validate })
+    Ok(AppConfig {
+        dataset: Arc::new(dataset),
+        validate,
+    })
 }
 
 fn parse_validate_flag() -> Result<bool, Box<dyn std::error::Error>> {
@@ -680,6 +763,26 @@ fn insert_record(
     }
 }
 
+fn clamp_u64_to_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn system_time_to_unix_secs(time: SystemTime) -> i64 {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => clamp_u64_to_i64(duration.as_secs()),
+        Err(_) => 0,
+    }
+}
+
+fn stable_rowid(key: &str) -> i64 {
+    let mut hash: u64 = 14695981039346656037;
+    for byte in key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    (hash & 0x7fff_ffff_ffff_ffff) as i64
+}
+
 fn setup_db(config: &AppConfig) -> Result<Connection> {
     let _ = (
         &config.dataset.metadata.root,
@@ -689,22 +792,26 @@ fn setup_db(config: &AppConfig) -> Result<Connection> {
         config.validate,
     );
     let db = Connection::open_in_memory()?;
-    let aux: Option<()> = None;
-    db.create_module("constrow", read_only_module::<ConstRowVTab>(), aux)?;
-    db.execute_batch("CREATE VIRTUAL TABLE const_row USING constrow;")?;
+    let aux = Some(Arc::clone(&config.dataset));
+    db.create_module("jsondex", read_only_module::<DatasetVTab>(), aux)?;
+    db.execute_batch("CREATE VIRTUAL TABLE dataset USING jsondex;")?;
     Ok(db)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{load_schema_config, setup_db, AppConfig, Dataset, DatasetMetadata, LoaderError};
+    use super::{
+        load_schema_config, setup_db, AppConfig, Dataset, DatasetMetadata, LoaderError,
+        RecordMetadata, SchemaConfig,
+    };
     use serde_json::json;
     use std::collections::HashMap;
     use std::env;
     use std::fs;
     use std::path::PathBuf;
     use std::process;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     struct TestDir {
         path: PathBuf,
@@ -730,32 +837,53 @@ mod tests {
     }
 
     #[test]
-    fn constrow_returns_single_constant_row() {
+    fn dataset_vtab_returns_record() {
+        let json_text = r#"{"id":1}"#;
+        let source_path = PathBuf::from("testdata/one.json");
+        let source_path_text = source_path.to_string_lossy().into_owned();
+        let mtime_secs: u64 = 42;
         let dataset = Dataset {
             metadata: DatasetMetadata {
                 root: PathBuf::from("testdata"),
-                schema: super::SchemaConfig {
+                schema: SchemaConfig {
                     path: PathBuf::from("testdata/.schema.json"),
                     primary_key_ptr: "/id".to_string(),
                     schema_json: json!({"x-primaryKey": "/id"}),
                 },
             },
-            records: Vec::new(),
-            index: HashMap::new(),
+            records: vec![RecordMetadata {
+                key: "alpha".to_string(),
+                json_bytes: json_text.as_bytes().to_vec(),
+                source_path,
+                line_no: 1,
+                mtime: UNIX_EPOCH + Duration::from_secs(mtime_secs),
+                size: json_text.len() as u64,
+            }],
+            index: HashMap::from([("alpha".to_string(), 0)]),
         };
         let config = AppConfig {
             validate: false,
-            dataset,
+            dataset: Arc::new(dataset),
         };
         let db = setup_db(&config).expect("db setup");
         let mut stmt = db
-            .prepare("SELECT value FROM const_row")
+            .prepare("SELECT key, json, source_path, line_no, mtime, size FROM dataset")
             .expect("prepare query");
         let mut rows = stmt.query([]).expect("query rows");
 
         let row = rows.next().expect("row fetch").expect("row exists");
-        let value: String = row.get(0).expect("value");
-        assert_eq!(value, "constant");
+        let key: String = row.get(0).expect("key");
+        let json: String = row.get(1).expect("json");
+        let source: String = row.get(2).expect("source");
+        let line_no: i64 = row.get(3).expect("line");
+        let mtime: i64 = row.get(4).expect("mtime");
+        let size: i64 = row.get(5).expect("size");
+        assert_eq!(key, "alpha");
+        assert_eq!(json, json_text);
+        assert_eq!(source, source_path_text);
+        assert_eq!(line_no, 1);
+        assert_eq!(mtime, mtime_secs as i64);
+        assert_eq!(size, json_text.len() as i64);
 
         let next = rows.next().expect("row fetch");
         assert!(next.is_none());
